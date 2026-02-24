@@ -1,0 +1,1495 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	osexec "os/exec"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fatih/color"
+
+	"github.com/lilendian0x00/xray-knife/v9/database"
+	"github.com/lilendian0x00/xray-knife/v9/pkg/core"
+	"github.com/lilendian0x00/xray-knife/v9/pkg/core/protocol"
+	pkgsingbox "github.com/lilendian0x00/xray-knife/v9/pkg/core/singbox"
+	pkgxray "github.com/lilendian0x00/xray-knife/v9/pkg/core/xray"
+	pkghttp "github.com/lilendian0x00/xray-knife/v9/pkg/http"
+	"github.com/lilendian0x00/xray-knife/v9/pkg/proxy/netns"
+	"github.com/lilendian0x00/xray-knife/v9/pkg/proxy/sysproxy"
+	"github.com/lilendian0x00/xray-knife/v9/utils"
+	"github.com/lilendian0x00/xray-knife/v9/utils/customlog"
+	"github.com/xtls/xray-core/common/uuid"
+)
+
+// Config holds all the settings for the proxy service.
+type Config struct {
+	CoreType            string `json:"coreType"`
+	InboundProtocol     string `json:"inboundProtocol"`
+	InboundTransport    string `json:"inboundTransport"`
+	InboundUUID         string `json:"inboundUUID"`
+	ListenAddr          string `json:"listenAddr"`
+	ListenPort          string `json:"listenPort"`
+	InboundConfigLink   string `json:"inboundConfigLink"`
+	Mode                string `json:"mode"`
+	Verbose             bool   `json:"verbose"`
+	InsecureTLS         bool   `json:"insecureTLS"`
+	EnableTLS           bool   `json:"enableTls"`
+	TLSSNI              string `json:"tlsSni"`
+	TLSALPN             string `json:"tlsAlpn"`
+	TLSCertFile         string `json:"tlsCertPath"`
+	TLSKeyFile          string `json:"tlsKeyPath"`
+	WSPath              string `json:"wsPath"`
+	WSHost              string `json:"wsHost"`
+	GRPCServiceName     string `json:"grpcServiceName"`
+	GRPCAuthority       string `json:"grpcAuthority"`
+	XHTTPMode           string `json:"xhttpMode"`
+	XHTTPHost           string `json:"xhttpHost"`
+	XHTTPPath           string `json:"xhttpPath"`
+	RotationInterval    uint32 `json:"rotationInterval"`
+	MaximumAllowedDelay uint16 `json:"maximumAllowedDelay"`
+	BatchSize           uint16 `json:"batchSize"`           // configs to test per rotation (0=auto)
+	Concurrency         uint16 `json:"concurrency"`         // concurrent test threads (0=auto)
+	HealthCheckInterval uint32 `json:"healthCheckInterval"` // seconds between health checks (0=disabled)
+	DrainTimeout        uint16 `json:"drainTimeout"`        // seconds to keep old connection alive during rotation (0=immediate)
+	BlacklistStrikes    uint16 `json:"blacklistStrikes"`    // failures before blacklisting (0=disabled)
+	BlacklistDuration   uint32 `json:"blacklistDuration"`   // seconds to blacklist a config
+	Shell               bool   `json:"shell"`               // launch shell in namespace (app mode)
+	NamespaceName       string `json:"namespaceName"`       // named namespace (app mode)
+	Chain               bool   `json:"chain"`               // enable outbound chaining (multi-hop)
+	ChainLinks          string `json:"chainLinks"`          // pipe-separated fixed chain links
+	ChainFile           string `json:"chainFile"`           // file with fixed chain links (one per line)
+	ChainHops           uint8  `json:"chainHops"`           // number of hops when selecting from pool
+	ChainRotation       string `json:"chainRotation"`       // none, exit, full
+	ConfigLinks         []string
+}
+
+// Details is a snapshot of the running proxy state.
+type Details struct {
+	Inbound          protocol.GeneralConfig   `json:"inbound"`
+	ActiveOutbound   *pkghttp.Result          `json:"activeOutbound,omitempty"`
+	RotationStatus   string                   `json:"rotationStatus"` // idle, testing, switching, stalled
+	NextRotationTime time.Time                `json:"nextRotationTime"`
+	RotationInterval uint32                   `json:"rotationInterval"`
+	TotalConfigs     int                      `json:"totalConfigs"`
+	ChainEnabled     bool                     `json:"chainEnabled"`
+	ChainHopInfos    []protocol.GeneralConfig `json:"chainHops,omitempty"`
+	ChainRotation    string                   `json:"chainRotation,omitempty"`
+}
+
+type blacklistEntry struct {
+	strikes          int
+	blacklistedUntil time.Time
+}
+
+// Service is the main proxy service engine.
+type Service struct {
+	config            Config
+	core              core.Core
+	logger            *log.Logger
+	inbound           protocol.Protocol
+	activeOutbound    *pkghttp.Result
+	activeChainHops   []protocol.Protocol // current chain hops (nil when not chaining)
+	mu                sync.RWMutex
+	rotationStatus    string
+	nextRotationTime  time.Time
+	sysProxyManager   sysproxy.Manager   // nil if mode != "system"
+	prevProxySettings *sysproxy.Settings // saved OS settings before modification
+	blacklist         map[string]*blacklistEntry
+	nsManager         *netns.Namespace   // non-nil when mode == "app"
+	nsTunnel          protocol.Instance  // the sing-box tunnel inside the namespace
+	proxyReady        chan struct{}       // closed when the first proxy instance starts
+	proxyReadyOnce    sync.Once
+}
+
+func New(config Config, logger *log.Logger) (*Service, error) {
+	// Crash recovery: restore stale system proxy settings from a previous unclean exit.
+	if stale, err := sysproxy.LoadState(); err == nil && stale != nil {
+		if mgr, mgrErr := sysproxy.New(); mgrErr == nil {
+			mgr.Restore(stale)
+		}
+		sysproxy.ClearState()
+	}
+
+	// Crash recovery: clean up stale network namespace from a previous unclean exit.
+	netns.RecoverFromCrash()
+
+	// App mode validation and overrides.
+	if config.Mode == "app" {
+		if runtime.GOOS != "linux" {
+			return nil, errors.New("app mode is only supported on Linux")
+		}
+		if os.Getuid() != 0 {
+			return nil, errors.New("app mode requires root privileges. Run with sudo")
+		}
+		// Default to shell mode if neither --shell nor --namespace is set.
+		if !config.Shell && config.NamespaceName == "" {
+			config.Shell = true
+		}
+		// Force SOCKS inbound on 0.0.0.0 so the namespace can reach the proxy
+		// through the veth pair.
+		config.ListenAddr = "0.0.0.0"
+		config.InboundProtocol = "socks"
+		config.InboundConfigLink = ""
+	}
+
+	s := &Service{
+		config:         config,
+		logger:         logger,
+		rotationStatus: "idle",
+		blacklist:      make(map[string]*blacklistEntry),
+		proxyReady:     make(chan struct{}),
+	}
+
+	// If no config links are provided via flags, fetch them from the database.
+	if len(s.config.ConfigLinks) == 0 {
+		s.logf(customlog.Processing, "No config links provided, fetching from database...\n")
+		dbLinks, err := database.GetConfigsForProxy()
+		if err != nil {
+			return nil, fmt.Errorf("could not fetch configs from database: %w", err)
+		}
+		if len(dbLinks) == 0 {
+			return nil, errors.New("no configs found in the database. Use 'subs fetch' to populate it")
+		}
+		s.config.ConfigLinks = dbLinks
+		s.logf(customlog.Success, "Loaded %d configs from the database for rotation pool.\n", len(s.config.ConfigLinks))
+	}
+
+	// Deduplicate config links to avoid wasting bandwidth testing the same config twice.
+	var dupsRemoved int
+	s.config.ConfigLinks, dupsRemoved = pkghttp.DeduplicateLinks(s.config.ConfigLinks)
+	if dupsRemoved > 0 {
+		s.logf(customlog.Info, "Removed %d duplicate configs from pool (%d unique remain).\n", dupsRemoved, len(s.config.ConfigLinks))
+	}
+
+	switch config.CoreType {
+	case "xray":
+		s.core = core.CoreFactory(core.XrayCoreType, config.InsecureTLS, config.Verbose)
+	case "sing-box":
+		s.core = core.CoreFactory(core.SingboxCoreType, config.InsecureTLS, config.Verbose)
+	default:
+		return nil, fmt.Errorf("allowed core types: (xray, sing-box), got: %s", config.CoreType)
+	}
+
+	inbound, err := s.createInbound()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create inbound: %w", err)
+	}
+	s.inbound = inbound
+
+	if err := s.core.SetInbound(inbound); err != nil {
+		return nil, fmt.Errorf("failed to set inbound: %w", err)
+	}
+
+	s.logf(customlog.Info, "==========INBOUND==========")
+	if s.logger != nil {
+		g := inbound.ConvertToGeneralConfig()
+		s.logger.Printf("Protocol: %s\nListen: %s:%s\nLink: %s\n", g.Protocol, g.Address, g.Port, g.OrigLink)
+	} else {
+		fmt.Printf("\n%v%s: %v\n", inbound.DetailsStr(), color.RedString("Link"), inbound.GetLink())
+	}
+	s.logf(customlog.Info, "============================\n\n")
+
+	// If system mode, configure the OS to route traffic through our local SOCKS proxy.
+	if config.Mode == "system" {
+		mgr, err := sysproxy.New()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create system proxy manager: %w", err)
+		}
+		prev, err := mgr.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read current system proxy settings: %w", err)
+		}
+		if err := sysproxy.SaveState(prev); err != nil {
+			return nil, fmt.Errorf("failed to save system proxy state for crash recovery: %w", err)
+		}
+		if err := mgr.Set(config.ListenAddr, config.ListenPort); err != nil {
+			sysproxy.ClearState()
+			return nil, fmt.Errorf("failed to set system proxy: %w", err)
+		}
+		s.sysProxyManager = mgr
+		s.prevProxySettings = prev
+		s.logf(customlog.Success, "System proxy configured: http://%s:%s\n", config.ListenAddr, config.ListenPort)
+	}
+
+	return s, nil
+}
+
+func (s *Service) setRotationStatus(status string) {
+	s.mu.Lock()
+	s.rotationStatus = status
+	s.mu.Unlock()
+}
+
+// GetCurrentDetails returns a snapshot of the proxy state under the read lock.
+func (s *Service) GetCurrentDetails() *Details {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	details := &Details{
+		Inbound:          s.inbound.ConvertToGeneralConfig(),
+		ActiveOutbound:   s.activeOutbound,
+		RotationStatus:   s.rotationStatus,
+		NextRotationTime: s.nextRotationTime,
+		RotationInterval: s.config.RotationInterval,
+		TotalConfigs:     len(s.config.ConfigLinks),
+		ChainEnabled:     s.config.Chain,
+		ChainRotation:    s.config.ChainRotation,
+	}
+	if s.activeChainHops != nil {
+		hopInfos := make([]protocol.GeneralConfig, len(s.activeChainHops))
+		for i, hop := range s.activeChainHops {
+			hopInfos[i] = hop.ConvertToGeneralConfig()
+		}
+		details.ChainHopInfos = hopInfos
+	}
+	return details
+}
+
+// ConfigCount returns how many config links are loaded.
+func (s *Service) ConfigCount() int {
+	return len(s.config.ConfigLinks)
+}
+
+// logf is a helper to direct logs to either the web logger or the CLI customlog.
+func (s *Service) logf(logType customlog.Type, format string, v ...interface{}) {
+	if s.logger != nil {
+		s.logger.Printf(format, v...)
+	} else {
+		customlog.Printf(logType, format, v...)
+	}
+}
+
+// healthCheck tests whether the active outbound connection is still working.
+func (s *Service) healthCheck(ctx context.Context) bool {
+	s.mu.RLock()
+	activeOutbound := s.activeOutbound
+	s.mu.RUnlock()
+	if activeOutbound == nil || activeOutbound.Protocol == nil {
+		return false
+	}
+
+	timeout := time.Duration(s.config.MaximumAllowedDelay) * time.Millisecond
+	client, instance, err := s.core.MakeHttpClient(ctx, activeOutbound.Protocol, timeout)
+	if err != nil {
+		return false
+	}
+	defer instance.Close()
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", "https://cloudflare.com/cdn-cgi/trace", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// Close restores the system proxy settings if they were modified, and cleans up state.
+func (s *Service) Close() {
+	// Tear down namespace resources (reverse order: tunnel first, then namespace).
+	if s.nsTunnel != nil {
+		s.logf(customlog.Processing, "Stopping namespace tunnel...\n")
+		s.nsTunnel.Close()
+		s.nsTunnel = nil
+	}
+	if s.nsManager != nil {
+		s.logf(customlog.Processing, "Cleaning up network namespace...\n")
+		if err := s.nsManager.Close(); err != nil {
+			s.logf(customlog.Failure, "Failed to clean up namespace: %v\n", err)
+		} else {
+			s.logf(customlog.Success, "Network namespace cleaned up.\n")
+		}
+		netns.ClearState()
+		s.nsManager = nil
+	}
+
+	if s.sysProxyManager != nil {
+		s.logf(customlog.Processing, "Restoring system proxy settings...\n")
+		if err := s.sysProxyManager.Restore(s.prevProxySettings); err != nil {
+			s.logf(customlog.Failure, "Failed to restore system proxy settings: %v\n", err)
+		} else {
+			s.logf(customlog.Success, "System proxy settings restored.\n")
+		}
+		sysproxy.ClearState()
+		s.sysProxyManager = nil
+	}
+}
+
+// signalProxyReady is called once after the first proxy instance is started
+// so that the app mode setup can proceed.
+func (s *Service) signalProxyReady() {
+	s.proxyReadyOnce.Do(func() { close(s.proxyReady) })
+}
+
+// setupAppMode creates the network namespace, veth pair, and TUN tunnel.
+// It must be called after the proxy instance is listening.
+func (s *Service) setupAppMode(ctx context.Context) error {
+	nsName := s.config.NamespaceName
+	if nsName == "" {
+		nsName = fmt.Sprintf("xk-%d", os.Getpid())
+	}
+
+	// Extract SOCKS credentials from the inbound so the tunnel can authenticate.
+	var socksUser, socksPass string
+	switch in := s.inbound.(type) {
+	case *pkgsingbox.Socks:
+		socksUser = in.Username
+		socksPass = in.Password
+	case *pkgxray.Socks:
+		socksUser = in.Username
+		socksPass = in.Password
+	}
+
+	port, _ := strconv.ParseUint(s.config.ListenPort, 10, 16)
+	nsCfg := netns.DefaultConfig(uint16(port))
+	nsCfg.Name = nsName
+	nsCfg.SocksUser = socksUser
+	nsCfg.SocksPass = socksPass
+
+	// Persist state for crash recovery.
+	if err := netns.SaveState(&netns.State{
+		Name:     nsName,
+		VethHost: nsCfg.VethHost,
+		VethNS:   nsCfg.VethNS,
+	}); err != nil {
+		return fmt.Errorf("failed to save namespace state: %w", err)
+	}
+
+	ns, err := netns.Setup(nsCfg)
+	if err != nil {
+		netns.ClearState()
+		return fmt.Errorf("failed to set up namespace: %w", err)
+	}
+	s.nsManager = ns
+
+	tunnel, err := netns.StartTunnel(ctx, nsName, nsCfg)
+	if err != nil {
+		ns.Close()
+		netns.ClearState()
+		s.nsManager = nil
+		return fmt.Errorf("failed to start tunnel in namespace: %w", err)
+	}
+	s.nsTunnel = tunnel
+
+	s.logf(customlog.Success, "Network namespace '%s' is ready.\n", nsName)
+	return nil
+}
+
+// Run blocks until the context is canceled, running either single or rotation mode.
+func (s *Service) Run(ctx context.Context, forceRotate <-chan struct{}) error {
+	if len(s.config.ConfigLinks) == 0 {
+		return errors.New("no configuration links provided")
+	}
+
+	if s.config.Mode == "app" {
+		return s.runAppMode(ctx, forceRotate)
+	}
+
+	if s.config.Chain {
+		return s.runChainMode(ctx, forceRotate)
+	}
+
+	if len(s.config.ConfigLinks) == 1 {
+		return s.runSingleMode(ctx, s.config.ConfigLinks[0])
+	}
+
+	return s.runRotationMode(ctx, forceRotate)
+}
+
+// runAppMode starts the proxy in a goroutine, waits for it to be ready,
+// sets up the namespace and tunnel, then either launches a shell or
+// waits for the proxy to finish.
+func (s *Service) runAppMode(ctx context.Context, forceRotate <-chan struct{}) error {
+	// Derive a context that we can cancel when the shell exits.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	// Run the underlying proxy (single or rotation) in a goroutine.
+	errCh := make(chan error, 1)
+	go func() {
+		if len(s.config.ConfigLinks) == 1 {
+			errCh <- s.runSingleMode(runCtx, s.config.ConfigLinks[0])
+		} else {
+			errCh <- s.runRotationMode(runCtx, forceRotate)
+		}
+	}()
+
+	// Wait for the proxy to start listening.
+	select {
+	case <-s.proxyReady:
+	case err := <-errCh:
+		return err
+	}
+
+	// Set up namespace + tunnel.
+	if err := s.setupAppMode(ctx); err != nil {
+		runCancel()
+		<-errCh
+		return err
+	}
+
+	if s.config.Shell {
+		s.logf(customlog.Info, "Launching shell in namespace. Type 'exit' to shut down.\n")
+		shellErr := s.nsManager.Shell(ctx)
+		// Shell exited — cancel the proxy and wait for it to finish.
+		runCancel()
+		<-errCh
+		// Treat signal-induced exits (e.g. Ctrl+C → exit code 130) as clean
+		// shutdowns rather than errors.
+		if ee, ok := shellErr.(*osexec.ExitError); ok && ee.ExitCode() >= 128 {
+			return nil
+		}
+		return shellErr
+	}
+
+	// Named namespace mode: print instructions and wait.
+	nsName := s.config.NamespaceName
+	if nsName == "" {
+		nsName = fmt.Sprintf("xk-%d", os.Getpid())
+	}
+	s.logf(customlog.Info, "Use: xray-knife exec %s -- <command>\n", nsName)
+	s.logf(customlog.Info, "Press Ctrl+C to shut down.\n")
+
+	return <-errCh
+}
+
+func (s *Service) runSingleMode(ctx context.Context, link string) error {
+	outbound, err := s.core.CreateProtocol(link)
+	if err != nil {
+		return fmt.Errorf("couldn't parse the single config %s: %w", link, err)
+	}
+	if err := outbound.Parse(); err != nil {
+		return fmt.Errorf("failed to parse single outbound config: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeOutbound = &pkghttp.Result{ConfigLink: link, Protocol: outbound}
+	s.mu.Unlock()
+
+	s.logf(customlog.Info, "==========OUTBOUND==========")
+	if s.logger != nil {
+		g := outbound.ConvertToGeneralConfig()
+		s.logger.Printf("Protocol: %s\nRemark: %s\nAddr: %s:%s\nLink: %s\n", g.Protocol, g.Remark, g.Address, g.Port, g.OrigLink)
+	} else {
+		fmt.Printf("\n%v%s: %v\n", outbound.DetailsStr(), color.RedString("Link"), outbound.GetLink())
+	}
+	s.logf(customlog.Info, "============================\n")
+
+	instance, err := s.core.MakeInstance(context.Background(), outbound)
+	if err != nil {
+		return fmt.Errorf("error making instance: %w", err)
+	}
+	defer instance.Close()
+
+	if err := instance.Start(); err != nil {
+		return fmt.Errorf("error starting instance: %w", err)
+	}
+	s.logf(customlog.Success, "Started listening for new connections...\n")
+	s.signalProxyReady()
+
+	<-ctx.Done() // Wait for shutdown signal
+	s.logf(customlog.Processing, "Shutting down proxy...\n")
+	return nil
+}
+
+func (s *Service) runRotationMode(ctx context.Context, forceRotate <-chan struct{}) error {
+	examiner, err := s.createExaminer()
+	if err != nil {
+		return err
+	}
+
+	var currentInstance protocol.Instance
+	defer func() {
+		if currentInstance != nil {
+			currentInstance.Close()
+		}
+	}()
+
+	var lastUsedLink string
+
+	// Initial setup
+	s.setRotationStatus("testing")
+	instance, result, err := s.findAndStartWorkingConfig(ctx, examiner, "")
+	if err != nil {
+		s.logf(customlog.Failure, "Could not find any working config on initial startup. Exiting.")
+		return err
+	}
+	currentInstance = instance
+	lastUsedLink = result.ConfigLink
+	s.setRotationStatus("idle")
+	s.signalProxyReady()
+
+	// Set up health check ticker if enabled
+	var healthTicker *time.Ticker
+	var healthTickerC <-chan time.Time
+	if s.config.HealthCheckInterval > 0 {
+		healthTicker = time.NewTicker(time.Duration(s.config.HealthCheckInterval) * time.Second)
+		healthTickerC = healthTicker.C
+		defer healthTicker.Stop()
+	}
+
+	for {
+		rotationDuration := time.Duration(s.config.RotationInterval) * time.Second
+		s.mu.RLock()
+		isStalled := s.rotationStatus == "stalled"
+		s.mu.RUnlock()
+		if isStalled {
+			rotationDuration = 30 * time.Second // Shorter retry interval if stalled
+		}
+
+		s.mu.Lock()
+		s.nextRotationTime = time.Now().Add(rotationDuration)
+		s.mu.Unlock()
+
+		s.logf(customlog.Info, "Next rotation in %v. Current outbound: %s", rotationDuration, lastUsedLink)
+
+		timer := time.NewTimer(rotationDuration)
+
+		doRotate := false
+		waitLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-forceRotate:
+				s.logf(customlog.Processing, "Manual rotation triggered.")
+				if !timer.Stop() {
+					<-timer.C
+				}
+				doRotate = true
+				break waitLoop
+			case <-timer.C:
+				s.logf(customlog.Processing, "Rotation interval elapsed.")
+				doRotate = true
+				break waitLoop
+			case <-healthTickerC:
+				if !s.healthCheck(ctx) {
+					s.logf(customlog.Warning, "Health check failed! Triggering immediate rotation.")
+					// Record a blacklist strike for the active config
+					if s.config.BlacklistStrikes > 0 && lastUsedLink != "" {
+						entry, exists := s.blacklist[lastUsedLink]
+						if !exists {
+							entry = &blacklistEntry{}
+							s.blacklist[lastUsedLink] = entry
+						}
+						entry.strikes++
+						if entry.strikes >= int(s.config.BlacklistStrikes) {
+							entry.blacklistedUntil = time.Now().Add(time.Duration(s.config.BlacklistDuration) * time.Second)
+							s.logf(customlog.Warning, "Blacklisted failed active config for %ds: %s\n", s.config.BlacklistDuration, lastUsedLink)
+						}
+					}
+					if !timer.Stop() {
+						<-timer.C
+					}
+					doRotate = true
+					break waitLoop
+				}
+			}
+		}
+
+		if !doRotate {
+			continue
+		}
+
+		s.setRotationStatus("testing")
+		instance, result, err := s.findAndStartWorkingConfig(ctx, examiner, lastUsedLink)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			s.logf(customlog.Warning, "Rotation failed to find a new working config. Keeping the current one. Retrying in 30s...")
+			s.setRotationStatus("stalled")
+			continue // Keep the old instance running and retry sooner
+		}
+
+		s.setRotationStatus("switching")
+		s.logf(customlog.Success, "Switching to new outbound: %s", result.ConfigLink)
+
+		if currentInstance != nil {
+			oldInstance := currentInstance
+			drainTimeout := time.Duration(s.config.DrainTimeout) * time.Second
+			if drainTimeout > 0 {
+				s.logf(customlog.Processing, "Draining old connection for %v...", drainTimeout)
+				go func() {
+					time.Sleep(drainTimeout)
+					oldInstance.Close()
+				}()
+			} else {
+				oldInstance.Close()
+			}
+		}
+		currentInstance = instance
+		lastUsedLink = result.ConfigLink
+		s.setRotationStatus("idle")
+	}
+}
+
+func (s *Service) findAndStartWorkingConfig(
+	ctx context.Context,
+	examiner *pkghttp.Examiner,
+	lastUsedLink string,
+) (protocol.Instance, *pkghttp.Result, error) {
+	availableLinks := make([]string, len(s.config.ConfigLinks))
+	copy(availableLinks, s.config.ConfigLinks)
+	rand.Shuffle(len(availableLinks), func(i, j int) { availableLinks[i], availableLinks[j] = availableLinks[j], availableLinks[i] })
+
+	// Filter out blacklisted configs
+	if s.config.BlacklistStrikes > 0 {
+		now := time.Now()
+		filtered := make([]string, 0, len(availableLinks))
+		for _, link := range availableLinks {
+			entry, exists := s.blacklist[link]
+			if !exists {
+				filtered = append(filtered, link)
+			} else if now.After(entry.blacklistedUntil) {
+				delete(s.blacklist, link)
+				filtered = append(filtered, link)
+			}
+		}
+		if len(filtered) == 0 {
+			s.logf(customlog.Warning, "All configs are blacklisted. Clearing blacklist.\n")
+			s.blacklist = make(map[string]*blacklistEntry)
+			filtered = availableLinks
+		} else if len(filtered) < len(availableLinks) {
+			s.logf(customlog.Info, "Skipped %d blacklisted configs.\n", len(availableLinks)-len(filtered))
+		}
+		availableLinks = filtered
+	}
+
+	// Determine batch size: use configured value or auto-derive from pool size
+	batchSize := int(s.config.BatchSize)
+	if batchSize == 0 {
+		batchSize = len(availableLinks) / 10
+		if batchSize < 10 {
+			batchSize = 10
+		}
+		if batchSize > 200 {
+			batchSize = 200
+		}
+	}
+	if batchSize > len(availableLinks) {
+		batchSize = len(availableLinks)
+	}
+
+	// Determine concurrency: use configured value or auto-derive from batch size
+	concurrency := int(s.config.Concurrency)
+	if concurrency == 0 {
+		concurrency = batchSize
+		if concurrency > 50 {
+			concurrency = 50
+		}
+	}
+
+	linksToTest := availableLinks[:batchSize]
+	s.logf(customlog.Processing, "Testing a batch of %d configs (concurrency: %d)...\n", len(linksToTest), concurrency)
+
+	testManager := pkghttp.NewTestManager(examiner, uint16(concurrency), false, s.logger)
+	resultsChan := make(chan *pkghttp.Result, len(linksToTest))
+	var results pkghttp.ConfigResults
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for res := range resultsChan {
+			results = append(results, res)
+		}
+	}()
+
+	testManager.RunTests(ctx, linksToTest, resultsChan, func() {
+		// This callback is for progress, which isn't used here, but is fine to keep.
+	})
+	close(resultsChan)
+	wg.Wait()
+
+	// If the context was cancelled (e.g. Ctrl+C), return immediately.
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
+
+	sort.Sort(results)
+
+	// Record strikes for failed configs in the blacklist
+	if s.config.BlacklistStrikes > 0 {
+		for _, res := range results {
+			if res.Status != "passed" && res.ConfigLink != "" {
+				entry, exists := s.blacklist[res.ConfigLink]
+				if !exists {
+					entry = &blacklistEntry{}
+					s.blacklist[res.ConfigLink] = entry
+				}
+				entry.strikes++
+				if entry.strikes >= int(s.config.BlacklistStrikes) {
+					entry.blacklistedUntil = time.Now().Add(time.Duration(s.config.BlacklistDuration) * time.Second)
+					s.logf(customlog.Warning, "Blacklisted config for %ds (%d strikes): %s\n", s.config.BlacklistDuration, entry.strikes, res.ConfigLink)
+				}
+			}
+		}
+	}
+
+	for _, res := range results {
+		// This check is now safe because we know `res.Protocol` is non-nil if status is "passed".
+		if res.Status == "passed" && res.Protocol != nil && res.ConfigLink != lastUsedLink {
+			s.logf(customlog.Success, "Found working config: %s (Delay: %dms)\n", res.ConfigLink, res.Delay)
+			s.logf(customlog.Info, "==========OUTBOUND==========")
+			if s.logger != nil {
+				g := res.Protocol.ConvertToGeneralConfig()
+				s.logger.Printf("Protocol: %s\nRemark: %s\nAddr: %s:%s\nLink: %s\n", g.Protocol, g.Remark, g.Address, g.Port, g.OrigLink)
+			} else {
+				fmt.Printf("%v", res.Protocol.DetailsStr())
+			}
+			s.logf(customlog.Info, "============================\n")
+
+			instance, err := s.core.MakeInstance(context.Background(), res.Protocol)
+			if err != nil {
+				s.logf(customlog.Failure, "Error making core instance with '%s': %v\n", res.ConfigLink, err)
+				continue
+			}
+			if err := instance.Start(); err != nil {
+				instance.Close()
+				s.logf(customlog.Failure, "Error starting core instance with '%s': %v\n", res.ConfigLink, err)
+				continue
+			}
+			s.mu.Lock()
+			s.activeOutbound = res
+			s.mu.Unlock()
+			return instance, res, nil
+		}
+	}
+
+	// FIX #3: Provide a useful error message summarizing the failures.
+	errorSummary := make(map[string]int)
+	var brokenCount int
+	for _, res := range results {
+		if res.Status != "passed" {
+			if res.Reason != "" {
+				errorSummary[res.Reason]++
+			} else if res.Status == "broken" {
+				brokenCount++
+			}
+		}
+	}
+
+	var errorStrings []string
+	if brokenCount > 0 {
+		errorStrings = append(errorStrings, fmt.Sprintf("%d were broken (invalid link format)", brokenCount))
+	}
+	// To avoid overly long error messages, you might want to limit how many reasons are shown.
+	for reason, count := range errorSummary {
+		errorStrings = append(errorStrings, fmt.Sprintf("%d failed with: %s", count, reason))
+	}
+
+	if len(errorStrings) > 0 {
+		return nil, nil, fmt.Errorf(
+			"no new working configs found in batch. Error summary: %s",
+			strings.Join(errorStrings, "; "),
+		)
+	}
+
+	return nil, nil, errors.New("failed to find any new working outbound configuration in this batch")
+}
+
+// chainHealthCheck tests whether the current chain is still working by
+// making an HTTP request through the full chain.
+func (s *Service) chainHealthCheck(ctx context.Context) bool {
+	s.mu.RLock()
+	hops := s.activeChainHops
+	s.mu.RUnlock()
+	if len(hops) < 2 {
+		return false
+	}
+
+	timeout := time.Duration(s.config.MaximumAllowedDelay) * time.Millisecond
+	client, instance, err := s.makeChainedHttpClient(ctx, hops, timeout)
+	if err != nil {
+		return false
+	}
+	defer instance.Close()
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", "https://cloudflare.com/cdn-cgi/trace", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// makeChainedInstance delegates to the concrete core's MakeChainedInstance.
+func (s *Service) makeChainedInstance(ctx context.Context, hops []protocol.Protocol) (protocol.Instance, error) {
+	switch c := s.core.(type) {
+	case *pkgxray.Core:
+		return c.MakeChainedInstance(ctx, hops)
+	case *pkgsingbox.Core:
+		return c.MakeChainedInstance(ctx, hops)
+	default:
+		return nil, fmt.Errorf("chaining is not supported with core type: %T", s.core)
+	}
+}
+
+// makeChainedHttpClient delegates to the concrete core's MakeChainedHttpClient.
+func (s *Service) makeChainedHttpClient(ctx context.Context, hops []protocol.Protocol, maxDelay time.Duration) (*http.Client, protocol.Instance, error) {
+	switch c := s.core.(type) {
+	case *pkgxray.Core:
+		return c.MakeChainedHttpClient(ctx, hops, maxDelay)
+	case *pkgsingbox.Core:
+		return c.MakeChainedHttpClient(ctx, hops, maxDelay)
+	default:
+		return nil, nil, fmt.Errorf("chaining is not supported with core type: %T", s.core)
+	}
+}
+
+// runChainMode runs the proxy in chain mode with optional rotation.
+func (s *Service) runChainMode(ctx context.Context, forceRotate <-chan struct{}) error {
+	isFixedChain := s.config.ChainLinks != "" || s.config.ChainFile != ""
+	rotation := s.config.ChainRotation
+	if rotation == "" {
+		rotation = "none"
+	}
+
+	// Fixed chains never rotate.
+	if isFixedChain {
+		return s.runFixedChainMode(ctx)
+	}
+
+	switch rotation {
+	case "none":
+		return s.runChainNoRotation(ctx)
+	case "exit":
+		return s.runChainExitRotation(ctx, forceRotate)
+	case "full":
+		return s.runChainFullRotation(ctx, forceRotate)
+	default:
+		return fmt.Errorf("unknown chain rotation mode: %s", rotation)
+	}
+}
+
+// runFixedChainMode parses a fixed chain and runs it without rotation.
+func (s *Service) runFixedChainMode(ctx context.Context) error {
+	hops, err := resolveFixedChain(s.core, s.config.ChainLinks, s.config.ChainFile)
+	if err != nil {
+		return fmt.Errorf("failed to resolve fixed chain: %w", err)
+	}
+
+	s.logChainHops(hops)
+
+	instance, err := s.makeChainedInstance(context.Background(), hops)
+	if err != nil {
+		return fmt.Errorf("failed to create chained instance: %w", err)
+	}
+	defer instance.Close()
+
+	if err := instance.Start(); err != nil {
+		return fmt.Errorf("failed to start chained instance: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeChainHops = hops
+	s.mu.Unlock()
+
+	s.logf(customlog.Success, "Chain proxy started (fixed, %d hops).\n", len(hops))
+	s.signalProxyReady()
+
+	<-ctx.Done()
+	s.logf(customlog.Processing, "Shutting down chain proxy...\n")
+	return nil
+}
+
+// runChainNoRotation selects hops from the pool once and runs without rotation.
+func (s *Service) runChainNoRotation(ctx context.Context) error {
+	numHops := int(s.config.ChainHops)
+	if numHops < 2 {
+		numHops = 2
+	}
+
+	hops, err := selectChainFromPool(s.core, s.config.ConfigLinks, numHops)
+	if err != nil {
+		return fmt.Errorf("failed to select chain from pool: %w", err)
+	}
+
+	s.logChainHops(hops)
+
+	instance, err := s.makeChainedInstance(context.Background(), hops)
+	if err != nil {
+		return fmt.Errorf("failed to create chained instance: %w", err)
+	}
+	defer instance.Close()
+
+	if err := instance.Start(); err != nil {
+		return fmt.Errorf("failed to start chained instance: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeChainHops = hops
+	s.mu.Unlock()
+
+	s.logf(customlog.Success, "Chain proxy started (no rotation, %d hops).\n", len(hops))
+	s.signalProxyReady()
+
+	<-ctx.Done()
+	s.logf(customlog.Processing, "Shutting down chain proxy...\n")
+	return nil
+}
+
+// runChainExitRotation keeps the first N-1 hops fixed and rotates the exit hop.
+func (s *Service) runChainExitRotation(ctx context.Context, forceRotate <-chan struct{}) error {
+	numHops := int(s.config.ChainHops)
+	if numHops < 2 {
+		numHops = 2
+	}
+
+	// Select initial chain.
+	hops, err := selectChainFromPool(s.core, s.config.ConfigLinks, numHops)
+	if err != nil {
+		return fmt.Errorf("failed to select initial chain from pool: %w", err)
+	}
+
+	// The fixed entry hops are all but the last.
+	fixedHops := make([]protocol.Protocol, len(hops)-1)
+	copy(fixedHops, hops[:len(hops)-1])
+
+	// Test the initial chain.
+	timeout := time.Duration(s.config.MaximumAllowedDelay) * time.Millisecond
+	client, testInst, err := s.makeChainedHttpClient(ctx, hops, timeout)
+	if err != nil {
+		return fmt.Errorf("failed to build initial chain for testing: %w", err)
+	}
+	if !s.testChainViaClient(ctx, client, timeout) {
+		testInst.Close()
+		return fmt.Errorf("initial chain failed health check")
+	}
+	testInst.Close()
+
+	// Start the real instance.
+	var currentInstance protocol.Instance
+	currentInstance, err = s.makeChainedInstance(context.Background(), hops)
+	if err != nil {
+		return fmt.Errorf("failed to create initial chained instance: %w", err)
+	}
+	defer func() {
+		if currentInstance != nil {
+			currentInstance.Close()
+		}
+	}()
+
+	if err := currentInstance.Start(); err != nil {
+		return fmt.Errorf("failed to start initial chained instance: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeChainHops = hops
+	s.mu.Unlock()
+
+	s.logChainHops(hops)
+	s.logf(customlog.Success, "Chain proxy started (exit rotation, %d hops).\n", len(hops))
+	s.setRotationStatus("idle")
+	s.signalProxyReady()
+
+	var lastExitLink string
+	if len(hops) > 0 {
+		lastExitLink = hops[len(hops)-1].GetLink()
+	}
+
+	// Set up health check ticker.
+	var healthTicker *time.Ticker
+	var healthTickerC <-chan time.Time
+	if s.config.HealthCheckInterval > 0 {
+		healthTicker = time.NewTicker(time.Duration(s.config.HealthCheckInterval) * time.Second)
+		healthTickerC = healthTicker.C
+		defer healthTicker.Stop()
+	}
+
+	for {
+		rotationDuration := time.Duration(s.config.RotationInterval) * time.Second
+		s.mu.Lock()
+		s.nextRotationTime = time.Now().Add(rotationDuration)
+		s.mu.Unlock()
+
+		timer := time.NewTimer(rotationDuration)
+		doRotate := false
+
+	exitWaitLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-forceRotate:
+				s.logf(customlog.Processing, "Manual chain rotation triggered.\n")
+				if !timer.Stop() {
+					<-timer.C
+				}
+				doRotate = true
+				break exitWaitLoop
+			case <-timer.C:
+				doRotate = true
+				break exitWaitLoop
+			case <-healthTickerC:
+				if !s.chainHealthCheck(ctx) {
+					s.logf(customlog.Warning, "Chain health check failed! Triggering rotation.\n")
+					if !timer.Stop() {
+						<-timer.C
+					}
+					doRotate = true
+					break exitWaitLoop
+				}
+			}
+		}
+
+		if !doRotate {
+			continue
+		}
+
+		s.setRotationStatus("testing")
+
+		// Select a new exit hop.
+		newHops, err := selectExitHopFromPool(s.core, s.config.ConfigLinks, fixedHops, lastExitLink)
+		if err != nil {
+			s.logf(customlog.Warning, "Failed to find new exit hop: %v. Keeping current chain.\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+
+		// Test the new chain.
+		testClient, testInst, err := s.makeChainedHttpClient(ctx, newHops, timeout)
+		if err != nil {
+			s.logf(customlog.Warning, "Failed to build new chain for testing: %v\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+		if !s.testChainViaClient(ctx, testClient, timeout) {
+			testInst.Close()
+			s.logf(customlog.Warning, "New chain failed health check. Keeping current chain.\n")
+			s.setRotationStatus("stalled")
+			continue
+		}
+		testInst.Close()
+
+		s.setRotationStatus("switching")
+
+		// Build and start new instance.
+		newInstance, err := s.makeChainedInstance(context.Background(), newHops)
+		if err != nil {
+			s.logf(customlog.Warning, "Failed to create new chained instance: %v\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+		if err := newInstance.Start(); err != nil {
+			newInstance.Close()
+			s.logf(customlog.Warning, "Failed to start new chained instance: %v\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+
+		// Drain old instance.
+		oldInstance := currentInstance
+		drainTimeout := time.Duration(s.config.DrainTimeout) * time.Second
+		if drainTimeout > 0 {
+			go func() {
+				time.Sleep(drainTimeout)
+				oldInstance.Close()
+			}()
+		} else {
+			oldInstance.Close()
+		}
+
+		currentInstance = newInstance
+		hops = newHops
+		lastExitLink = hops[len(hops)-1].GetLink()
+
+		s.mu.Lock()
+		s.activeChainHops = hops
+		s.mu.Unlock()
+
+		s.logChainHops(hops)
+		s.logf(customlog.Success, "Chain exit hop rotated.\n")
+		s.setRotationStatus("idle")
+	}
+}
+
+// runChainFullRotation rotates the entire chain on each cycle.
+func (s *Service) runChainFullRotation(ctx context.Context, forceRotate <-chan struct{}) error {
+	numHops := int(s.config.ChainHops)
+	if numHops < 2 {
+		numHops = 2
+	}
+	timeout := time.Duration(s.config.MaximumAllowedDelay) * time.Millisecond
+
+	// Select and test initial chain.
+	hops, err := s.findWorkingChain(ctx, numHops, timeout)
+	if err != nil {
+		return fmt.Errorf("failed to find initial working chain: %w", err)
+	}
+
+	var currentInstance protocol.Instance
+	currentInstance, err = s.makeChainedInstance(context.Background(), hops)
+	if err != nil {
+		return fmt.Errorf("failed to create initial chained instance: %w", err)
+	}
+	defer func() {
+		if currentInstance != nil {
+			currentInstance.Close()
+		}
+	}()
+
+	if err := currentInstance.Start(); err != nil {
+		return fmt.Errorf("failed to start initial chained instance: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeChainHops = hops
+	s.mu.Unlock()
+
+	s.logChainHops(hops)
+	s.logf(customlog.Success, "Chain proxy started (full rotation, %d hops).\n", len(hops))
+	s.setRotationStatus("idle")
+	s.signalProxyReady()
+
+	// Set up health check ticker.
+	var healthTicker *time.Ticker
+	var healthTickerC <-chan time.Time
+	if s.config.HealthCheckInterval > 0 {
+		healthTicker = time.NewTicker(time.Duration(s.config.HealthCheckInterval) * time.Second)
+		healthTickerC = healthTicker.C
+		defer healthTicker.Stop()
+	}
+
+	for {
+		rotationDuration := time.Duration(s.config.RotationInterval) * time.Second
+		s.mu.Lock()
+		s.nextRotationTime = time.Now().Add(rotationDuration)
+		s.mu.Unlock()
+
+		timer := time.NewTimer(rotationDuration)
+		doRotate := false
+
+	fullWaitLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-forceRotate:
+				s.logf(customlog.Processing, "Manual chain rotation triggered.\n")
+				if !timer.Stop() {
+					<-timer.C
+				}
+				doRotate = true
+				break fullWaitLoop
+			case <-timer.C:
+				doRotate = true
+				break fullWaitLoop
+			case <-healthTickerC:
+				if !s.chainHealthCheck(ctx) {
+					s.logf(customlog.Warning, "Chain health check failed! Triggering full rotation.\n")
+					if !timer.Stop() {
+						<-timer.C
+					}
+					doRotate = true
+					break fullWaitLoop
+				}
+			}
+		}
+
+		if !doRotate {
+			continue
+		}
+
+		s.setRotationStatus("testing")
+
+		newHops, err := s.findWorkingChain(ctx, numHops, timeout)
+		if err != nil {
+			s.logf(customlog.Warning, "Failed to find new working chain: %v. Keeping current chain.\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+
+		s.setRotationStatus("switching")
+
+		newInstance, err := s.makeChainedInstance(context.Background(), newHops)
+		if err != nil {
+			s.logf(customlog.Warning, "Failed to create new chained instance: %v\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+		if err := newInstance.Start(); err != nil {
+			newInstance.Close()
+			s.logf(customlog.Warning, "Failed to start new chained instance: %v\n", err)
+			s.setRotationStatus("stalled")
+			continue
+		}
+
+		oldInstance := currentInstance
+		drainTimeout := time.Duration(s.config.DrainTimeout) * time.Second
+		if drainTimeout > 0 {
+			go func() {
+				time.Sleep(drainTimeout)
+				oldInstance.Close()
+			}()
+		} else {
+			oldInstance.Close()
+		}
+
+		currentInstance = newInstance
+		hops = newHops
+
+		s.mu.Lock()
+		s.activeChainHops = hops
+		s.mu.Unlock()
+
+		s.logChainHops(hops)
+		s.logf(customlog.Success, "Full chain rotated.\n")
+		s.setRotationStatus("idle")
+	}
+}
+
+// findWorkingChain tries multiple random chain combinations from the pool
+// and returns the first one that passes a health check.
+func (s *Service) findWorkingChain(ctx context.Context, numHops int, timeout time.Duration) ([]protocol.Protocol, error) {
+	maxAttempts := 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		hops, err := selectChainFromPool(s.core, s.config.ConfigLinks, numHops)
+		if err != nil {
+			continue
+		}
+
+		client, testInst, err := s.makeChainedHttpClient(ctx, hops, timeout)
+		if err != nil {
+			continue
+		}
+
+		if s.testChainViaClient(ctx, client, timeout) {
+			testInst.Close()
+			return hops, nil
+		}
+		testInst.Close()
+	}
+	return nil, fmt.Errorf("could not find a working chain after %d attempts", maxAttempts)
+}
+
+// testChainViaClient sends a test HTTP request through the given client.
+func (s *Service) testChainViaClient(ctx context.Context, client *http.Client, timeout time.Duration) bool {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", "https://cloudflare.com/cdn-cgi/trace", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// logChainHops logs the details of the chain hops.
+func (s *Service) logChainHops(hops []protocol.Protocol) {
+	s.logf(customlog.Info, "==========CHAIN==========\n")
+	for i, hop := range hops {
+		role := "relay"
+		if i == 0 {
+			role = "entry"
+		} else if i == len(hops)-1 {
+			role = "exit"
+		}
+		g := hop.ConvertToGeneralConfig()
+		if s.logger != nil {
+			s.logger.Printf("Hop %d (%s): %s %s:%s [%s]\n", i+1, role, g.Protocol, g.Address, g.Port, g.Remark)
+		} else {
+			fmt.Printf("  Hop %d (%s): %s %s:%s [%s]\n", i+1, role, g.Protocol, g.Address, g.Port, g.Remark)
+		}
+	}
+	s.logf(customlog.Info, "=========================\n")
+}
+
+func (s *Service) createExaminer() (*pkghttp.Examiner, error) {
+	return pkghttp.NewExaminer(pkghttp.Options{
+		Core:                   s.config.CoreType,
+		MaxDelay:               s.config.MaximumAllowedDelay,
+		Verbose:                s.config.Verbose,
+		InsecureTLS:            s.config.InsecureTLS,
+		TestEndpoint:           "https://cloudflare.com/cdn-cgi/trace",
+		TestEndpointHttpMethod: "GET",
+		DoSpeedtest:            false,
+		DoIPInfo:               true,
+	})
+}
+
+func (s *Service) createInbound() (protocol.Protocol, error) {
+	if s.config.InboundConfigLink != "" {
+		inbound, err := s.core.CreateProtocol(s.config.InboundConfigLink)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create inbound from config link: %w", err)
+		}
+		if err := inbound.Parse(); err != nil {
+			return nil, fmt.Errorf("failed to parse inbound config link: %w", err)
+		}
+		return inbound, nil
+	}
+
+	if s.config.Mode == "system" {
+		// System mode uses an HTTP inbound (xray) or mixed HTTP+SOCKS inbound (sing-box)
+		// so the OS system proxy settings work with all browsers.
+		switch s.config.CoreType {
+		case "xray":
+			return &pkgxray.Http{
+				Remark: "Listener", Address: s.config.ListenAddr, Port: s.config.ListenPort,
+			}, nil
+		case "sing-box":
+			return &pkgsingbox.Http{
+				Remark: "Listener", Address: s.config.ListenAddr, Port: s.config.ListenPort,
+			}, nil
+		}
+		return nil, fmt.Errorf("unsupported core type for system mode: %s", s.config.CoreType)
+	}
+
+	u := uuid.New()
+	uuidV4 := s.config.InboundUUID
+	if uuidV4 == "random" || uuidV4 == "" {
+		uuidV4 = u.String()
+	}
+
+	switch s.config.CoreType {
+	case "xray":
+		return createXrayInbound(s.config, uuidV4)
+	case "sing-box":
+		return createSingboxInbound(s.config)
+	}
+	return nil, fmt.Errorf("inbound could not be created for core type: %s", s.config.CoreType)
+}
+
+func createXrayInbound(cfg Config, uuid string) (protocol.Protocol, error) {
+	switch cfg.InboundProtocol {
+	case "socks":
+		user, err := utils.GeneratePassword(4)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate socks username: %w", err)
+		}
+		pass, err := utils.GeneratePassword(4)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate socks password: %w", err)
+		}
+		return &pkgxray.Socks{
+			Remark: "Listener", Address: cfg.ListenAddr, Port: cfg.ListenPort,
+			Username: user, Password: pass,
+		}, nil
+	case "vmess":
+		vmess := &pkgxray.Vmess{
+			Remark:  "Listener",
+			Address: cfg.ListenAddr,
+			Port:    cfg.ListenPort,
+			ID:      uuid,
+		}
+		switch cfg.InboundTransport {
+		case "tcp":
+			vmess.Network = "tcp"
+		case "ws":
+			vmess.Network = "ws"
+			vmess.Path = cfg.WSPath
+			vmess.Host = cfg.WSHost
+		case "grpc":
+			vmess.Network = "grpc"
+			vmess.Path = cfg.GRPCServiceName // For VMESS, Path is used for ServiceName
+			vmess.Host = cfg.GRPCAuthority
+		case "xhttp":
+			vmess.Network = "xhttp"
+			vmess.Type = cfg.XHTTPMode
+			vmess.Host = cfg.XHTTPHost
+			vmess.Path = cfg.XHTTPPath
+			vmess.Security = "none"
+		default:
+			return nil, fmt.Errorf("unsupported vmess transport: %s", cfg.InboundTransport)
+		}
+
+		if cfg.EnableTLS {
+			vmess.TLS = "tls"
+			vmess.CertFile = cfg.TLSCertFile
+			vmess.KeyFile = cfg.TLSKeyFile
+			vmess.SNI = cfg.TLSSNI
+			vmess.ALPN = cfg.TLSALPN
+		}
+
+		return vmess, nil
+	case "vless":
+		vless := &pkgxray.Vless{
+			Remark:  "Listener",
+			Address: cfg.ListenAddr,
+			Port:    cfg.ListenPort,
+			ID:      uuid,
+		}
+		switch cfg.InboundTransport {
+		case "tcp":
+			vless.Type = "tcp"
+		case "ws":
+			vless.Type = "ws"
+			vless.Path = cfg.WSPath
+			vless.Host = cfg.WSHost
+		case "grpc":
+			vless.Type = "grpc"
+			vless.ServiceName = cfg.GRPCServiceName
+			vless.Authority = cfg.GRPCAuthority
+		case "xhttp":
+			vless.Type = "xhttp"
+			vless.Host = cfg.XHTTPHost
+			vless.Path = cfg.XHTTPPath
+			vless.Security = "none"
+			vless.Mode = cfg.XHTTPMode
+		default:
+			return nil, fmt.Errorf("unsupported vless transport: %s", cfg.InboundTransport)
+		}
+
+		if cfg.EnableTLS {
+			vless.Security = "tls"
+			vless.CertFile = cfg.TLSCertFile
+			vless.KeyFile = cfg.TLSKeyFile
+			vless.SNI = cfg.TLSSNI
+			vless.ALPN = cfg.TLSALPN
+		}
+		return vless, nil
+	}
+	return nil, fmt.Errorf("unsupported xray inbound protocol/transport: %s/%s", cfg.InboundProtocol, cfg.InboundTransport)
+}
+
+func createSingboxInbound(cfg Config) (protocol.Protocol, error) {
+	// Currently, only SOCKS is implemented for Singbox inbound in this logic
+	if cfg.InboundProtocol == "socks" {
+		user, err := utils.GeneratePassword(4)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate socks username: %w", err)
+		}
+		pass, err := utils.GeneratePassword(4)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate socks password: %w", err)
+		}
+		return &pkgsingbox.Socks{
+			Remark: "Listener", Address: cfg.ListenAddr, Port: cfg.ListenPort,
+			Username: user, Password: pass,
+		}, nil
+	}
+	return nil, fmt.Errorf("unsupported sing-box inbound protocol: %s", cfg.InboundProtocol)
+}
